@@ -329,15 +329,25 @@ python3 blind_sqli_extract.py --req request.txt --https --auto --mode auto --con
 
 | Flag | Purpose |
 |------|---------|
-| `--threads N` | Parallel character search (default 5). Big speed-up for boolean/error. Use `1` for time mode. |
-| `--confirm N` | Time mode only: re-check a positive timing result N times to reject network-jitter false positives (default 1). |
+| `--threads N` | Parallel workers for character *and* row search (default 10). Used in all modes, including time. |
+| `--charset SET` | Restrict the character set: `full` (default), `loweralnum`, `alnum`, `lower`, `upper`, `digits`, `hex`. Fewer chars = fewer requests/char (huge for time mode). |
+| `--confirm N` | Time mode: re-check a positive result N times to reject jitter false positives (default 1). |
+| `--info` | In `--auto`, also extract DB version + name. **Off by default** — these are long strings and slow, especially in time mode. |
 | `--delay S` | Seconds a TRUE condition sleeps in time mode (default 3). |
 | `--timeout S` | Per-request timeout (default 15; raise above `--delay`). |
 | `--max-len N` | Max characters/length to probe (default 64). |
 
-> **Time mode + threads:** high concurrency can cause false positives (a FALSE
-> request queued behind another thread's sleep looks slow). Use `--threads 1`
-> with `--mode time`; the tool warns you if you don't.
+**Speed tips (especially for time-based labs, which are inherently slow):**
+
+- **Threading now applies to time mode too** — character positions and rows are
+  extracted in parallel; `--confirm` re-checks positives to stay reliable. If you
+  see a garbled character, lower `--threads` or raise `--confirm`/`--delay`.
+- **Use `--charset`** when you know the format: `--charset hex` for hashes,
+  `--charset loweralnum` for typical passwords. Cuts binary-search steps per char.
+- **`--auto` skips version/DB extraction** by default and goes straight to the
+  data. Add `--info` only if you actually want the banner.
+- **Row enumeration is parallel** — the tool counts rows with `COUNT(*)` then
+  extracts them all concurrently.
 
 ---
 
