@@ -52,12 +52,25 @@ Python 3.8+.
 
 ## Quick start
 
-The most hands-off run — point it at a saved request and let it detect
-everything (mode, context, DBMS, oracle) then walk you through the database:
+The most hands-off run — just point it at a saved request. `--auto` implies
+`--mode auto` and `--context auto`, so it detects **oracle mode, injection
+context, and DBMS** by itself, then walks you through the database:
 
 ```bash
-python3 blind_sqli_extract.py --req request.txt --https --auto --mode auto --context auto
+python3 blind_sqli_extract.py --req request.txt --https --auto
 ```
+
+What `--auto` resolves automatically, per blind type:
+
+- **boolean** (response content differs) — derives the oracle from a marker,
+  status code, or response length; fingerprints the engine.
+- **error** (TRUE triggers a SQL error) — sweeps all engines to find the one
+  whose divide-by-zero/overflow flips the response.
+- **time** (response never changes) — finds the engine whose `SLEEP` delays,
+  with a confirmation re-check, and forces `--threads 1` for reliability.
+
+It tries them in that order (boolean → error → time) and stops at the first that
+works.
 
 Or a single, fully specified extraction:
 
@@ -189,9 +202,9 @@ How the tool tells TRUE from FALSE.
 | Mode | Use when | Notes |
 |------|----------|-------|
 | `boolean` | The response **visibly changes** for TRUE vs FALSE | Fastest. Give `--true-marker`, or omit it to auto-derive from status code / response length |
-| `time` | The response is **identical** regardless of the query | Uses `SLEEP`/`pg_sleep`/`WAITFOR`. Slower; pair with `--confirm` |
+| `time` | The response is **identical** regardless of the query | Uses `SLEEP`/`pg_sleep`/`WAITFOR`. Slower; auto-forces `--threads 1`; pair with `--confirm` |
 | `error` | A TRUE condition can trigger a **DB error** (500 / error page) | Divide-by-zero / overflow triggers, auto-detected by status code |
-| `auto` | You're **not sure** | Tries boolean first, falls back to time |
+| `auto` | You're **not sure** | Tries boolean → error → time, and fingerprints the DBMS + context in the same pass. This is what `--auto` uses. |
 
 **Auto-derived oracle (no marker):** in boolean/error mode without `--true-marker`,
 calibration diffs the TRUE vs FALSE responses and picks a discriminator in this
@@ -405,9 +418,10 @@ python3 blind_sqli_extract.py --req request.txt --https \
     --query "SELECT password FROM users WHERE username='administrator'"
 ```
 
-**Unknown everything** (let it figure it out, then dump interactively):
+**Unknown everything** (let it figure it out, then dump interactively) — works
+for all four labs above without changing any flags:
 ```bash
-python3 blind_sqli_extract.py --req request.txt --https --auto --mode auto --context auto
+python3 blind_sqli_extract.py --req request.txt --https --auto
 ```
 
 ---
