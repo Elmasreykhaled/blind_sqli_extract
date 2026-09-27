@@ -12,6 +12,9 @@ oracle type, and the backend DBMS.
 
 ---
 
+<img width="2000" height="3000" alt="image" src="https://github.com/user-attachments/assets/af323c1d-0d1e-4d2a-a880-f44b7f1ad8fb" />
+
+
 ## Table of contents
 
 - [Requirements](#requirements)
